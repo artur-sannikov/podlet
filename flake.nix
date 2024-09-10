@@ -1,5 +1,5 @@
 {
-  description = "Generate Podman Quadlet files from a Podman command, compose file, or existing object ";
+  description = "Generate Podman Quadlet files from a Podman command, compose file, or existing object";
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
   };
@@ -12,7 +12,7 @@
     in
     {
       packages = forAllSystems (system: {
-        default = pkgsFor.${system}.callPackage ./. { };
+        podlet = pkgsFor.${system}.callPackage ./. { };
       });
     };
 }
