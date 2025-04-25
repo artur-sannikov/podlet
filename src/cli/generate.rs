@@ -6,7 +6,9 @@
 
 use std::{
     env,
+    marker::PhantomData,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::PathBuf,
     process::Command,
 };
 
@@ -17,7 +19,10 @@ use color_eyre::{
 };
 use indexmap::IndexMap;
 use ipnet::IpNet;
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::{
+    de::{self, value::MapAccessDeserializer, DeserializeOwned, MapAccess, SeqAccess, Visitor},
+    Deserialize, Deserializer,
+};
 
 use crate::quadlet::{self, Globals, Install, IpRange, ResourceKind};
 
@@ -46,6 +51,22 @@ pub enum Generate {
     /// Only supports pods created with `podman pod create`.
     /// The command used to create the pod is parsed to generate the Quadlet file.
     Pod {
+        /// Ignore the `podman pod create --infra-conmon-pidfile` option if it is set.
+        ///
+        /// Quadlet sets the `--infra-conmon-pidfile` option when generating the systemd service
+        /// unit file for the pod, and it cannot be set multiple times. Podlet will, by default,
+        /// return an error if the option is used.
+        #[arg(long)]
+        ignore_infra_conmon_pidfile: bool,
+
+        /// Ignore the `podman pod create --pod-id-file` option if it is set.
+        ///
+        /// Quadlet sets the `--pod-id-file` option when generating the systemd service unit file
+        /// for the pod, and it cannot be set multiple times. Podlet will, by default, return an
+        /// error if the option is used.
+        #[arg(long)]
+        ignore_pod_id_file: bool,
+
         /// Name or ID of the pod
         ///
         /// Passed to `podman pod inspect`.
@@ -101,8 +122,32 @@ impl Generate {
         match self {
             Self::Container { container } => Ok(vec![ContainerParser::from_container(&container)?
                 .into_quadlet_file(None, name, unit, install)]),
-            Self::Pod { pod } => {
-                Ok(PodParser::from_pod(&pod)?.into_quadlet_files(name, unit, install))
+            Self::Pod {
+                ignore_infra_conmon_pidfile,
+                ignore_pod_id_file,
+                pod,
+            } => {
+                let pod = PodParser::from_pod(&pod)?;
+
+                if pod.infra_conmon_pidfile.is_some() && !ignore_infra_conmon_pidfile {
+                    Err(eyre!(
+                        "the `--infra-conmon-pidfile` option is not \
+                        supported as it is set by Quadlet"
+                    )
+                    .suggestion(
+                        "use `podlet generate pod --ignore-infra-conmon-pidfile` \
+                        to remove the option",
+                    ))
+                } else if pod.pod_id_file.is_some() && !ignore_pod_id_file {
+                    Err(eyre!(
+                        "the `--pod-id-file` option is not supported as it is set by Quadlet"
+                    )
+                    .suggestion(
+                        "use `podlet generate pod --ignore-pod-id-file` to remove the option",
+                    ))
+                } else {
+                    Ok(pod.into_quadlet_files(name, unit, install))
+                }
             }
             Self::Network { network } => Ok(vec![
                 NetworkInspect::from_network(&network)?.into_quadlet_file(name, unit, install)
@@ -119,7 +164,7 @@ impl Generate {
 
 /// [`Parser`] for container creation CLI options.
 #[derive(Parser, Debug)]
-#[command(no_binary_name = true)]
+#[command(no_binary_name = true, disable_help_flag = true)]
 struct ContainerParser {
     /// Podman global options
     #[command(flatten)]
@@ -239,7 +284,7 @@ impl ContainerInspect {
 
 /// [`Parser`] for pod creation CLI options.
 #[derive(Parser, Debug)]
-#[command(no_binary_name = true)]
+#[command(no_binary_name = true, disable_help_flag = true)]
 struct PodParser {
     /// Podman global options
     #[command(flatten)]
@@ -248,6 +293,24 @@ struct PodParser {
     /// The \[Pod\] section
     #[command(subcommand)]
     pod: Pod,
+
+    /// File to write the PID of the infra container's conmon process to.
+    ///
+    /// Not supported as Quadlet sets this when generating the pod's `.service` unit file.
+    ///
+    /// Ignored with the `podlet generate pod --ignore-infra-conmon-pidfile` option. Otherwise
+    /// results in error if set.
+    #[arg(long, global = true)]
+    infra_conmon_pidfile: Option<PathBuf>,
+
+    /// File to write the pod's ID to.
+    ///
+    /// Not supported as Quadlet sets this when generating the pod's `.service` unit file.
+    ///
+    /// Ignored with the `podlet generate pod --ignore-pod-id-file` option. Otherwise results in
+    /// error if set.
+    #[arg(long, global = true)]
+    pod_id_file: Option<PathBuf>,
 
     /// Containers associated with the pod.
     #[arg(skip)]
@@ -302,6 +365,9 @@ impl PodParser {
             global_args,
             pod,
             containers,
+            // Handled by Generate::try_into_quadlet_files()
+            infra_conmon_pidfile: _,
+            pod_id_file: _,
         } = self;
 
         let pod_name = pod.name();
@@ -746,16 +812,56 @@ fn podman_inspect<T: DeserializeOwned>(
         .section(stderr.trim().to_owned().header("Podman Stderr:"));
     }
 
-    // `podman inspect` returns a JSON array which is also valid YAML so serde_yaml can be reused.
-    // There should only be a single object in the array, so the first one is returned.
-    serde_yaml::from_str::<Vec<T>>(&stdout)
+    serde_json::Deserializer::from_str(&stdout)
+        .deserialize_any(PodmanInspectVisitor {
+            resource_kind,
+            resource,
+            value: PhantomData,
+        })
         .wrap_err_with(|| {
             format!("error deserializing from `podman {resource_kind} inspect {resource}` output")
         })
-        .with_section(|| stdout.trim().to_owned().header("Podman Stdout:"))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| eyre!("no {resource_kind}s matching `{resource}`"))
+        .with_section(|| stdout.trim().to_owned().header("Podman Stdout:"))
+}
+
+/// A [`Visitor`] for deserializing the output of `podman inspect`.
+///
+/// Podman v5.0.0 and newer always returns an array from `podman inspect`. Older versions may return
+/// a single JSON object if there is only one result, notably for `podman pod inspect`.
+///
+/// If an array is encountered, the first object is returned.
+struct PodmanInspectVisitor<'a, T> {
+    resource_kind: ResourceKind,
+    resource: &'a str,
+    value: PhantomData<T>,
+}
+
+impl<'a, 'de, T: Deserialize<'de>> Visitor<'de> for PodmanInspectVisitor<'a, T> {
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the output of `podman {} inspect`, an object or array",
+            self.resource_kind
+        )
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+        T::deserialize(MapAccessDeserializer::new(map))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let Self {
+            resource_kind,
+            resource,
+            ..
+        } = self;
+
+        seq.next_element()?.ok_or_else(|| {
+            de::Error::custom(format_args!("no {resource_kind}s matching `{resource}`"))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -767,5 +873,10 @@ mod tests {
     #[test]
     fn verify_container_parser_cli() {
         ContainerParser::command().debug_assert();
+    }
+
+    #[test]
+    fn verify_pod_parser_cli() {
+        PodParser::command().debug_assert();
     }
 }

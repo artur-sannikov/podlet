@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     io::{self, IsTerminal},
-    mem,
+    iter, mem,
     path::{Path, PathBuf},
 };
 
@@ -11,12 +11,14 @@ use color_eyre::{
     eyre::{bail, ensure, eyre, OptionExt, WrapErr},
     Help,
 };
-use compose_spec::{service::Command, Identifier, Network, Networks, Resource, Service, Volumes};
+use compose_spec::{
+    service::Command, Identifier, Network, Networks, Options, Resource, Service, Volumes,
+};
 use indexmap::IndexMap;
 
 use crate::quadlet::{self, container::volume::Source, Globals};
 
-use super::{k8s, Container, File, GlobalArgs, Unit};
+use super::{k8s, Build, Container, File, GlobalArgs, Unit};
 
 /// Converts a [`Command`] into a [`Vec<String>`], splitting the [`String`](Command::String) variant
 /// as a shell would.
@@ -93,8 +95,13 @@ impl Compose {
             compose_file,
         } = self;
 
-        let compose = read_from_file_or_stdin(compose_file.as_deref())
+        let mut options = compose_spec::Compose::options();
+        options.apply_merge(true);
+        let compose = read_from_file_or_stdin(compose_file.as_deref(), &options)
             .wrap_err("error reading compose file")?;
+        compose
+            .validate_all()
+            .wrap_err("error validating compose file")?;
 
         if kube {
             let mut k8s_file = k8s::File::try_from(compose)
@@ -163,10 +170,13 @@ impl Compose {
 /// - Stdin was selected and stdin is a terminal.
 /// - No path was given and none of the default files could be opened.
 /// - There was an error deserializing [`compose_spec::Compose`].
-fn read_from_file_or_stdin(path: Option<&Path>) -> color_eyre::Result<compose_spec::Compose> {
+fn read_from_file_or_stdin(
+    path: Option<&Path>,
+    options: &Options,
+) -> color_eyre::Result<compose_spec::Compose> {
     let (compose_file, path) = if let Some(path) = path {
         if path.as_os_str() == "-" {
-            return read_from_stdin();
+            return read_from_stdin(options);
         }
         let compose_file = fs::File::open(path)
             .wrap_err("could not open provided compose file")
@@ -181,7 +191,7 @@ fn read_from_file_or_stdin(path: Option<&Path>) -> color_eyre::Result<compose_sp
         ];
 
         if !io::stdin().is_terminal() {
-            return read_from_stdin();
+            return read_from_stdin(options);
         }
 
         let mut result = None;
@@ -199,7 +209,8 @@ fn read_from_file_or_stdin(path: Option<&Path>) -> color_eyre::Result<compose_sp
         )?
     };
 
-    serde_yaml::from_reader(compose_file)
+    options
+        .from_yaml_reader(compose_file)
         .wrap_err_with(|| format!("File `{}` is not a valid compose file", path.display()))
 }
 
@@ -208,13 +219,15 @@ fn read_from_file_or_stdin(path: Option<&Path>) -> color_eyre::Result<compose_sp
 /// # Errors
 ///
 /// Returns an error if stdin is a terminal or there was an error deserializing.
-fn read_from_stdin() -> color_eyre::Result<compose_spec::Compose> {
+fn read_from_stdin(options: &Options) -> color_eyre::Result<compose_spec::Compose> {
     let stdin = io::stdin();
     if stdin.is_terminal() {
         bail!("cannot read compose from stdin, stdin is a terminal");
     }
 
-    serde_yaml::from_reader(stdin).wrap_err("data from stdin is not a valid compose file")
+    options
+        .from_yaml_reader(stdin)
+        .wrap_err("data from stdin is not a valid compose file")
 }
 
 /// Attempt to convert [`Service`]s, [`Networks`], and [`Volumes`] into [`File`]s.
@@ -246,43 +259,26 @@ fn parts_try_into_files(
         .collect();
 
     let mut pod_ports = Vec::new();
-    let mut files = services
-        .into_iter()
-        .map(|(name, service)| {
-            let mut file = service_try_into_quadlet_file(
-                service,
-                name,
-                unit.clone(),
-                install.clone(),
-                &volume_has_options,
-            )?;
-            if let (
-                Some(pod_name),
-                quadlet::File {
-                    name,
-                    resource: quadlet::Resource::Container(container),
-                    ..
-                },
-            ) = (&pod_name, &mut file)
-            {
-                *name = format!("{pod_name}-{name}");
-                pod_ports.extend(mem::take(&mut container.publish_port));
-                container.pod = Some(format!("{pod_name}.pod"));
-            }
-            Ok(file)
-        })
-        .chain(networks_try_into_quadlet_files(
-            networks,
-            unit.as_ref(),
-            install.as_ref(),
-        ))
-        .chain(volumes_try_into_quadlet_files(
-            volumes,
-            unit.as_ref(),
-            install.as_ref(),
-        ))
-        .map(|result| result.map(Into::into))
-        .collect::<Result<Vec<File>, _>>()?;
+    let mut files = services_try_into_quadlet_files(
+        services,
+        unit.as_ref(),
+        install.as_ref(),
+        &volume_has_options,
+        pod_name.as_deref(),
+        &mut pod_ports,
+    )
+    .chain(networks_try_into_quadlet_files(
+        networks,
+        unit.as_ref(),
+        install.as_ref(),
+    ))
+    .chain(volumes_try_into_quadlet_files(
+        volumes,
+        unit.as_ref(),
+        install.as_ref(),
+    ))
+    .map(|result| result.map(Into::into))
+    .collect::<Result<Vec<File>, _>>()?;
 
     if let Some(name) = pod_name {
         let pod = quadlet::Pod {
@@ -303,11 +299,80 @@ fn parts_try_into_files(
     Ok(files)
 }
 
+/// Attempt to convert Compose [`Service`]s into [`quadlet::File`]s.
+///
+/// `volume_has_options` should be a map from volume [`Identifier`]s to whether the volume has any
+/// options set. It is used to determine whether to link to a [`quadlet::Volume`] in the created
+/// [`quadlet::Container`].
+///
+/// If `pod_name` is [`Some`] and a service has any published ports, they are taken from the
+/// created [`quadlet::Container`] and added to `pod_ports`.
+///
+/// # Errors
+///
+/// Returns an error if there was an error [adding](Unit::add_dependency()) a service
+/// [`Dependency`](compose_spec::service::Dependency) to the [`Unit`], converting the
+/// [`Build`](compose_spec::service::Build) section into a [`quadlet::Build`] file, or converting
+/// the [`Service`] into a [`quadlet::Container`] file.
+fn services_try_into_quadlet_files<'a>(
+    services: IndexMap<Identifier, Service>,
+    unit: Option<&'a Unit>,
+    install: Option<&'a quadlet::Install>,
+    volume_has_options: &'a HashMap<Identifier, bool>,
+    pod_name: Option<&'a str>,
+    pod_ports: &'a mut Vec<String>,
+) -> impl Iterator<Item = color_eyre::Result<quadlet::File>> + 'a {
+    services.into_iter().flat_map(move |(name, mut service)| {
+        if service.image.is_some() && service.build.is_some() {
+            return iter::once(Err(eyre!(
+                "error converting service `{name}`: `image` and `build` cannot both be set"
+            )))
+            .chain(None);
+        }
+
+        let build = service.build.take().map(|build| {
+            let build = Build::try_from(build.into_long()).wrap_err_with(|| {
+                format!(
+                    "error converting `build` for service `{name}` into a Quadlet `.build` file"
+                )
+            })?;
+            let image = format!("{}.build", build.name()).try_into()?;
+            service.image = Some(image);
+            Ok(quadlet::File {
+                name: build.name().to_owned(),
+                unit: unit.cloned(),
+                resource: build.into(),
+                globals: Globals::default(),
+                service: None,
+                install: install.cloned(),
+            })
+        });
+        if let Some(result @ Err(_)) = build {
+            return iter::once(result).chain(None);
+        }
+
+        let container = service_try_into_quadlet_file(
+            service,
+            name,
+            unit.cloned(),
+            install.cloned(),
+            volume_has_options,
+            pod_name,
+            pod_ports,
+        );
+
+        iter::once(container).chain(build)
+    })
+}
+
 /// Attempt to convert a compose [`Service`] into a [`quadlet::File`].
 ///
 /// `volume_has_options` should be a map from volume [`Identifier`]s to whether the volume has any
 /// options set. It is used to determine whether to link to a [`quadlet::Volume`] in the created
 /// [`quadlet::Container`].
+///
+/// If `pod_name` is [`Some`] and the `service` has any published ports, they are taken from the
+/// created [`quadlet::Container`] and added to `pod_ports`.
 ///
 /// # Errors
 ///
@@ -320,13 +385,22 @@ fn service_try_into_quadlet_file(
     mut unit: Option<Unit>,
     install: Option<quadlet::Install>,
     volume_has_options: &HashMap<Identifier, bool>,
+    pod_name: Option<&str>,
+    pod_ports: &mut Vec<String>,
 ) -> color_eyre::Result<quadlet::File> {
     // Add any service dependencies to the [Unit] section of the Quadlet file.
     let dependencies = mem::take(&mut service.depends_on).into_long();
     if !dependencies.is_empty() {
         let unit = unit.get_or_insert_with(Unit::default);
         for (ident, dependency) in dependencies {
-            unit.add_dependency(&ident, dependency).wrap_err_with(|| {
+            unit.add_dependency(
+                pod_name.map_or_else(
+                    || ident.to_string(),
+                    |pod_name| format!("{pod_name}-{ident}"),
+                ),
+                dependency,
+            )
+            .wrap_err_with(|| {
                 format!("error adding dependency on `{ident}` to service `{name}`")
             })?;
         }
@@ -355,8 +429,16 @@ fn service_try_into_quadlet_file(
         }
     }
 
+    let name = if let Some(pod_name) = pod_name {
+        container.pod = Some(format!("{pod_name}.pod"));
+        pod_ports.extend(mem::take(&mut container.publish_port));
+        format!("{pod_name}-{name}")
+    } else {
+        name.into()
+    };
+
     Ok(quadlet::File {
-        name: name.into(),
+        name,
         unit,
         resource: container.into(),
         globals: global_args.into(),

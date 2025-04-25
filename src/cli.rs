@@ -1,3 +1,4 @@
+mod build;
 mod compose;
 mod container;
 mod generate;
@@ -25,7 +26,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use clap::{builder::TypedValueParser, Parser, Subcommand};
+use clap::{builder::TypedValueParser, ArgAction, Parser, Subcommand};
 use color_eyre::{
     eyre::{ensure, eyre, WrapErr},
     Help,
@@ -36,9 +37,9 @@ use path_clean::PathClean;
 use crate::quadlet::{self, Downgrade, DowngradeError, Globals, HostPaths, PodmanVersion};
 
 use self::{
-    compose::Compose, container::Container, generate::Generate, global_args::GlobalArgs,
-    image::Image, install::Install, kube::Kube, network::Network, pod::Pod, service::Service,
-    unit::Unit, volume::Volume,
+    build::Build, compose::Compose, container::Container, generate::Generate,
+    global_args::GlobalArgs, image::Image, install::Install, kube::Kube, network::Network,
+    pod::Pod, service::Service, unit::Unit, volume::Volume,
 };
 
 #[allow(clippy::option_option)]
@@ -398,6 +399,7 @@ enum PodmanCommands {
     ///
     /// For details on options see:
     /// https://docs.podman.io/en/stable/markdown/podman-systemd.unit.5.html
+    #[command(disable_help_flag = true)]
     Run {
         /// The \[Container\] section
         #[command(flatten)]
@@ -406,6 +408,17 @@ enum PodmanCommands {
         /// The \[Service\] section
         #[command(flatten)]
         service: Service,
+
+        /// Print help
+        // Changed from default to support `podman run -h`, i.e. `podman run --hostname`.
+        #[arg(
+            short = '?',
+            long,
+            action = ArgAction::Help,
+            help = "Print help (see more with '--help')",
+            long_help = "Print help (see a summary with '-?')"
+        )]
+        help: (),
     },
 
     /// Generate a Podman Quadlet `.pod` file
@@ -448,6 +461,16 @@ enum PodmanCommands {
         volume: Volume,
     },
 
+    /// Generate a Podman Quadlet `.build` file
+    ///
+    /// For details on options see:
+    /// https://docs.podman.io/en/stable/markdown/podman-build.1.html
+    Build {
+        /// The \[Build\] section
+        #[command(flatten)]
+        build: Box<Build>,
+    },
+
     /// Generate a Podman Quadlet `.image` file
     ///
     /// For details on options see:
@@ -467,6 +490,7 @@ impl From<PodmanCommands> for quadlet::Resource {
             PodmanCommands::Kube { kube } => (*kube).into(),
             PodmanCommands::Network { network } => (*network).into(),
             PodmanCommands::Volume { volume } => volume.into(),
+            PodmanCommands::Build { build } => (*build).into(),
             PodmanCommands::Image { image } => (*image).into(),
         }
     }
@@ -507,6 +531,7 @@ impl PodmanCommands {
             Self::Kube { kube } => kube.name(),
             Self::Network { network } => network.name(),
             Self::Volume { volume } => volume.name(),
+            Self::Build { build } => build.name(),
             Self::Image { image } => image.name(),
         }
     }
